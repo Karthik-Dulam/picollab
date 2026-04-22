@@ -1,17 +1,39 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { createHash } from "node:crypto";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { renderDiff } from "@mariozechner/pi-coding-agent";
 import { Box, Container, Spacer, Text } from "@mariozechner/pi-tui";
-import { createHash } from "node:crypto";
 
 const POLL_INTERVAL_MS = 1000;
 const DEBOUNCE_MS = 250;
 const MAX_DIFF_CHARS = 40_000;
 const MUTATION_TOOLS = new Set(["edit", "write", "bash"]);
 
+type Snapshot = Map<string, string>;
+
+type ExternalChangeMessageDetails = {
+	repoRoot: string;
+	files: string[];
+	diff: string;
+	truncated: boolean;
+	source: "external";
+	detectedAt: number;
+};
+
+type PendingExternalChange = {
+	details: ExternalChangeMessageDetails;
+	signature: string;
+	snapshot: Snapshot;
+};
+
 type RepoSnapshot = {
 	root: string;
+	trackedFiles: string[];
+	baseline: Snapshot;
 	lastSignature: string | undefined;
+	pending: PendingExternalChange | undefined;
 	watcher: fs.FSWatcher | undefined;
 	poller: NodeJS.Timeout | undefined;
 	debounceTimer: NodeJS.Timeout | undefined;
@@ -25,24 +47,8 @@ type RepoSnapshot = {
 	lastNoticeAt: number;
 };
 
-type ExternalChangeMessageDetails = {
-	repoRoot: string;
-	files: string[];
-	diff: string;
-	truncated: boolean;
-	source: "external";
-	detectedAt: number;
-};
-
 function trimTrailingNewline(text: string): string {
 	return text.replace(/\n+$/g, "");
-}
-
-function splitLines(text: string): string[] {
-	return text
-		.split(/\r?\n/)
-		.map((line) => line.trim())
-		.filter(Boolean);
 }
 
 function uniqueSorted(values: string[]): string[] {
@@ -51,9 +57,7 @@ function uniqueSorted(values: string[]): string[] {
 
 async function runGit(pi: ExtensionAPI, cwd: string, args: string[]): Promise<string | undefined> {
 	const result = await pi.exec("git", args, { cwd, timeout: 15_000 });
-	if (result.code !== 0) {
-		return undefined;
-	}
+	if (result.code !== 0) return undefined;
 	return trimTrailingNewline(result.stdout);
 }
 
@@ -61,50 +65,68 @@ async function findRepoRoot(pi: ExtensionAPI, cwd: string): Promise<string | und
 	return runGit(pi, cwd, ["rev-parse", "--show-toplevel"]);
 }
 
-async function getChangeNames(pi: ExtensionAPI, root: string): Promise<string[]> {
-	const [unstaged, staged] = await Promise.all([
-		runGit(pi, root, ["diff", "--name-only", "--diff-filter=ACDMR"]),
-		runGit(pi, root, ["diff", "--cached", "--name-only", "--diff-filter=ACDMR"]),
-	]);
-	return uniqueSorted([...splitLines(unstaged ?? ""), ...splitLines(staged ?? "")]);
+async function getTrackedFiles(pi: ExtensionAPI, root: string): Promise<string[]> {
+	const output = await runGit(pi, root, ["ls-files"]);
+	if (!output) return [];
+	return output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
 
-async function getDiffPayload(pi: ExtensionAPI, root: string): Promise<{ diff: string; files: string[]; truncated: boolean }> {
-	const [unstagedDiff, stagedDiff] = await Promise.all([
-		runGit(pi, root, ["diff", "--no-ext-diff", "--unified=4", "--diff-algorithm=histogram", "--"]),
-		runGit(pi, root, ["diff", "--cached", "--no-ext-diff", "--unified=4", "--diff-algorithm=histogram", "--"]),
-	]);
-
-	const diffs = [unstagedDiff, stagedDiff].filter((diff): diff is string => Boolean(diff));
-	const combined = trimTrailingNewline(diffs.join("\n\n"));
-	const files = await getChangeNames(pi, root);
-	const truncated = combined.length > MAX_DIFF_CHARS;
-	const diff = truncated ? `${combined.slice(0, MAX_DIFF_CHARS)}\n\n... [diff truncated]` : combined;
-	return { diff, files, truncated };
+async function readTextFile(filePath: string): Promise<string> {
+	try {
+		return await fs.promises.readFile(filePath, "utf8");
+	} catch {
+		return "";
+	}
 }
 
-function buildMessage(details: ExternalChangeMessageDetails): string {
-	const fileLines = details.files.length > 0
-		? details.files.map((file) => `- ${file}`).join("\n")
-		: "- (no tracked files detected; diff may be empty due to a transient state)";
+async function readSnapshot(root: string, files: string[]): Promise<Snapshot> {
+	const entries = await Promise.all(
+		files.map(async (file) => [file, await readTextFile(path.join(root, file))] as const),
+	);
+	return new Map(entries);
+}
 
-	const truncatedNote = details.truncated
-		? "\n\nNote: diff was truncated to keep the context manageable."
-		: "";
+async function renderFileDiff(
+	pi: ExtensionAPI,
+	root: string,
+	filePath: string,
+	oldText: string,
+	newText: string,
+): Promise<string> {
+	if (oldText === newText) return "";
 
-	return [
-		"External git change detected outside pi.",
-		"Likely source: user, script, or another agent.",
-		"",
-		"Changed files:",
-		fileLines,
-		"",
-		"Unified diff:",
-		"```diff",
-		details.diff || "(no diff text available)",
-		"```",
-		truncatedNote,
-	].join("\n");
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-external-git-watch-"));
+	const oldFile = path.join(tmpDir, "old.txt");
+	const newFile = path.join(tmpDir, "new.txt");
+
+	try {
+		fs.writeFileSync(oldFile, oldText, "utf8");
+		fs.writeFileSync(newFile, newText, "utf8");
+
+		const result = await pi.exec(
+			"git",
+			["diff", "--no-index", "--no-ext-diff", "--unified=4", "--", oldFile, newFile],
+			{ cwd: root, timeout: 15_000 },
+		);
+
+		if (result.code !== 0 && result.code !== 1) {
+			return "";
+		}
+
+		let diff = trimTrailingNewline(result.stdout || result.stderr || "");
+		if (!diff) return "";
+
+		diff = diff.replace(/^diff --git .*$/m, `diff --git a/${filePath} b/${filePath}`);
+		diff = diff.replace(/^--- .*$/m, `--- a/${filePath}`);
+		diff = diff.replace(/^\+\+\+ .*$/m, `+++ b/${filePath}`);
+		return diff;
+	} finally {
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+}
+
+function hashText(text: string): string {
+	return createHash("sha256").update(text).digest("hex");
 }
 
 function statusText(repo: RepoSnapshot | undefined): string {
@@ -113,6 +135,82 @@ function statusText(repo: RepoSnapshot | undefined): string {
 	return `external-git-watch: watching ${repo.root}`;
 }
 
+function makeSignature(details: ExternalChangeMessageDetails): string {
+	return hashText([details.repoRoot, details.files.join("\0"), details.diff].join("\0"));
+}
+
+async function computeWorkspaceChange(
+	pi: ExtensionAPI,
+	root: string,
+	trackedFiles: string[],
+	baseline: Snapshot,
+): Promise<PendingExternalChange | undefined> {
+	const current = await readSnapshot(root, trackedFiles);
+	const changedFiles: string[] = [];
+	const diffs: string[] = [];
+
+	for (const filePath of trackedFiles) {
+		const oldText = baseline.get(filePath) ?? "";
+		const newText = current.get(filePath) ?? "";
+		if (oldText === newText) continue;
+
+		const diff = await renderFileDiff(pi, root, filePath, oldText, newText);
+		if (diff) {
+			changedFiles.push(filePath);
+			diffs.push(diff);
+		}
+	}
+
+	if (changedFiles.length === 0) return undefined;
+
+	const combinedDiff = trimTrailingNewline(diffs.join("\n\n"));
+	const truncated = combinedDiff.length > MAX_DIFF_CHARS;
+	const diff = truncated ? `${combinedDiff.slice(0, MAX_DIFF_CHARS)}\n\n... [diff truncated]` : combinedDiff;
+	const details: ExternalChangeMessageDetails = {
+		repoRoot: root,
+		files: uniqueSorted(changedFiles),
+		diff,
+		truncated,
+		source: "external",
+		detectedAt: Date.now(),
+	};
+
+	return {
+		details,
+		signature: makeSignature(details),
+		snapshot: current,
+	};
+}
+
+function renderExternalChangeMessage(content: string, theme: any, expanded: boolean): Box {
+	const lines = content.split("\n");
+	const additions = lines.filter((line) => line.startsWith("+") && !line.startsWith("+++"));
+	const removals = lines.filter((line) => line.startsWith("-") && !line.startsWith("---"));
+
+	const box = new Box(1, 1, (t: string) => theme.bg("customMessageBg", t));
+	const container = new Container();
+
+	let header = theme.fg("toolTitle", theme.bold("external git change"));
+	header += theme.fg("dim", "  ");
+	header += theme.fg("success", `+${additions.length}`);
+	header += theme.fg("dim", " / ");
+	header += theme.fg("error", `-${removals.length}`);
+	container.addChild(new Text(header, 0, 0));
+
+	if (expanded) {
+		const rendered = renderDiff(content).split("\n");
+		container.addChild(new Spacer(1));
+		for (const line of rendered.slice(0, 30)) {
+			container.addChild(new Text(line, 0, 0));
+		}
+		if (rendered.length > 30) {
+			container.addChild(new Text(theme.fg("muted", `... ${rendered.length - 30} more diff lines`), 0, 0));
+		}
+	}
+
+	box.addChild(container);
+	return box;
+}
 
 export default function externalGitWatchExtension(pi: ExtensionAPI) {
 	let repo: RepoSnapshot | undefined;
@@ -135,11 +233,10 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 
 	const refreshBaseline = async () => {
 		if (!repo) return;
-		const diffPayload = await getDiffPayload(pi, repo.root);
-		const signature = createHash("sha256").update(diffPayload.files.join("\0")).update("\0").update(diffPayload.diff).digest("hex");
-		repo.lastSignature = signature;
+		repo.baseline = await readSnapshot(repo.root, repo.trackedFiles);
+		repo.lastSignature = undefined;
+		repo.pending = undefined;
 	};
-
 
 	const updateStatus = (ctx?: any) => {
 		if (!ctx?.ui) return;
@@ -175,47 +272,12 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 					continue;
 				}
 
-				const diffPayload = await getDiffPayload(pi, repo.root);
+				const pending = await computeWorkspaceChange(pi, repo.root, repo.trackedFiles, repo.baseline);
+				if (!pending) continue;
+				if (pending.signature === repo.lastSignature) continue;
 
-				const signature = createHash("sha256")
-					.update(diffPayload.files.join("\0"))
-					.update("\0")
-					.update(diffPayload.diff)
-					.digest("hex");
-
-				if (signature === repo.lastSignature) {
-					continue;
-				}
-
-				repo.lastSignature = signature;
-
-				if (diffPayload.files.length === 0 && diffPayload.diff.length === 0) {
-					continue;
-				}
-
-				if (Date.now() - repo.lastNoticeAt < 150) {
-					continue;
-				}
-				repo.lastNoticeAt = Date.now();
-
-				const details: ExternalChangeMessageDetails = {
-					repoRoot: repo.root,
-					files: diffPayload.files,
-					diff: diffPayload.diff,
-					truncated: diffPayload.truncated,
-					source: "external",
-					detectedAt: Date.now(),
-				};
-
-				pi.sendMessage(
-					{
-						customType: "external-git-change",
-						content: details.diff,
-						display: true,
-						details,
-					},
-					{ deliverAs: "steer" },
-				);
+				repo.lastSignature = pending.signature;
+				repo.pending = pending;
 			} while (repo.queuedScan);
 		} finally {
 			repo.scanning = false;
@@ -224,33 +286,7 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 
 	pi.registerMessageRenderer("external-git-change", (message, { expanded }, theme) => {
 		const content = typeof message.content === "string" ? message.content : "";
-		const lines = content.split("\n");
-		const additions = lines.filter((line) => line.startsWith("+") && !line.startsWith("+++"));
-		const removals = lines.filter((line) => line.startsWith("-") && !line.startsWith("---"));
-
-		const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
-		const container = new Container();
-
-		let header = theme.fg("toolTitle", theme.bold("external git change"));
-		header += theme.fg("dim", "  ");
-		header += theme.fg("success", `+${additions.length}`);
-		header += theme.fg("dim", " / ");
-		header += theme.fg("error", `-${removals.length}`);
-		container.addChild(new Text(header, 0, 0));
-
-		if (expanded) {
-			const rendered = renderDiff(content).split("\n");
-			container.addChild(new Spacer(1));
-			for (const line of rendered.slice(0, 30)) {
-				container.addChild(new Text(line, 0, 0));
-			}
-			if (rendered.length > 30) {
-				container.addChild(new Text(theme.fg("muted", `... ${rendered.length - 30} more diff lines`), 0, 0));
-			}
-		}
-
-		box.addChild(container);
-		return box;
+		return renderExternalChangeMessage(content, theme, expanded);
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -263,9 +299,13 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 			return;
 		}
 
+		const trackedFiles = await getTrackedFiles(pi, root);
 		repo = {
 			root,
+			trackedFiles,
+			baseline: await readSnapshot(root, trackedFiles),
 			lastSignature: undefined,
+			pending: undefined,
 			watcher: undefined,
 			poller: undefined,
 			debounceTimer: undefined,
@@ -279,7 +319,6 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 			lastNoticeAt: 0,
 		};
 
-		await refreshBaseline();
 		repo.ready = true;
 
 		try {
@@ -300,12 +339,31 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 
 		ctx.ui.setStatus("external-git-watch", statusText(repo));
 		ctx.ui.notify(`external-git-watch active in ${root}`, "info");
-		void scan("startup");
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		ctx.ui.setStatus("external-git-watch", "external-git-watch: inactive");
 		cleanup();
+	});
+
+	pi.on("context", async (event, _ctx) => {
+		if (!repo?.pending) return { messages: event.messages };
+		const pending = repo.pending;
+		repo.pending = undefined;
+		repo.baseline = pending.snapshot;
+		repo.lastSignature = pending.signature;
+		return {
+			messages: [
+				...event.messages,
+				{
+					role: "custom",
+					customType: "external-git-change",
+					content: pending.details.diff,
+					display: true,
+					details: pending.details,
+				},
+			],
+		};
 	});
 
 	pi.on("agent_start", async () => {
