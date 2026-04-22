@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { renderDiff } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
@@ -11,7 +12,7 @@ const MUTATION_TOOLS = new Set(["edit", "write", "bash"]);
 type RepoSnapshot = {
 	root: string;
 	lastSignature: string | undefined;
-	watcher: NodeJS.Timeout | undefined;
+	watcher: fs.FSWatcher | undefined;
 	poller: NodeJS.Timeout | undefined;
 	debounceTimer: NodeJS.Timeout | undefined;
 	scanning: boolean;
@@ -20,6 +21,8 @@ type RepoSnapshot = {
 	mutationDepth: number;
 	mutationCallIds: Set<string>;
 	ready: boolean;
+	enabled: boolean;
+	lastNoticeAt: number;
 };
 
 type ExternalChangeMessageDetails = {
@@ -104,19 +107,25 @@ function buildMessage(details: ExternalChangeMessageDetails): string {
 	].join("\n");
 }
 
+function statusText(repo: RepoSnapshot | undefined): string {
+	if (!repo) return "external-git-watch: inactive";
+	if (!repo.enabled) return `external-git-watch: disabled (${repo.root})`;
+	return `external-git-watch: watching ${repo.root}`;
+}
+
 export default function externalGitWatchExtension(pi: ExtensionAPI) {
 	let repo: RepoSnapshot | undefined;
 
 	const cleanup = () => {
 		if (!repo) return;
-		if (repo.watcher) clearTimeout(repo.watcher);
+		if (repo.watcher) repo.watcher.close();
 		if (repo.poller) clearInterval(repo.poller);
 		if (repo.debounceTimer) clearTimeout(repo.debounceTimer);
 		repo = undefined;
 	};
 
 	const scheduleScan = () => {
-		if (!repo || !repo.ready) return;
+		if (!repo || !repo.ready || !repo.enabled) return;
 		if (repo.debounceTimer) clearTimeout(repo.debounceTimer);
 		repo.debounceTimer = setTimeout(() => {
 			void scan("debounced");
@@ -130,8 +139,26 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 		repo.lastSignature = signature;
 	};
 
+	const updateStatus = (ctx?: any) => {
+		if (!ctx?.ui) return;
+		ctx.ui.setStatus("external-git-watch", statusText(repo));
+	};
+
+	const setEnabled = async (enabled: boolean, ctx?: any) => {
+		if (!repo) return;
+		repo.enabled = enabled;
+		if (enabled) {
+			await refreshBaseline();
+			scheduleScan();
+		} else {
+			if (repo.debounceTimer) clearTimeout(repo.debounceTimer);
+			repo.debounceTimer = undefined;
+		}
+		updateStatus(ctx);
+	};
+
 	const scan = async (_reason: string) => {
-		if (!repo || !repo.ready || repo.scanning) {
+		if (!repo || !repo.ready || !repo.enabled || repo.scanning) {
 			if (repo) repo.queuedScan = true;
 			return;
 		}
@@ -163,6 +190,11 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 				if (diffPayload.files.length === 0 && diffPayload.diff.length === 0) {
 					continue;
 				}
+
+				if (Date.now() - repo.lastNoticeAt < 150) {
+					continue;
+				}
+				repo.lastNoticeAt = Date.now();
 
 				const details: ExternalChangeMessageDetails = {
 					repoRoot: repo.root,
@@ -211,6 +243,7 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 		const root = await findRepoRoot(pi, ctx.cwd);
 		if (!root) {
 			ctx.ui.notify("external-git-watch disabled: current directory is not a git repo", "warning");
+			ctx.ui.setStatus("external-git-watch", "external-git-watch: inactive");
 			return;
 		}
 
@@ -226,24 +259,36 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 			mutationDepth: 0,
 			mutationCallIds: new Set<string>(),
 			ready: false,
+			enabled: true,
+			lastNoticeAt: 0,
 		};
 
 		await refreshBaseline();
 		repo.ready = true;
 
 		try {
-			scheduleScan();
+			repo.watcher = fs.watch(root, { recursive: true }, () => {
+				scheduleScan();
+			});
+		} catch {
+			// Recursive watch is not always available; polling remains as fallback.
+		}
+
+		try {
 			repo.poller = setInterval(() => {
 				void scan("poll");
 			}, POLL_INTERVAL_MS);
 		} catch {
-			// Ignore watcher/poller setup failures; scan on agent events still works.
+			// Ignore poller setup failures; scan on agent events still works.
 		}
 
+		ctx.ui.setStatus("external-git-watch", statusText(repo));
 		ctx.ui.notify(`external-git-watch active in ${root}`, "info");
+		void scan("startup");
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (_event, ctx) => {
+		ctx.ui.setStatus("external-git-watch", "external-git-watch: inactive");
 		cleanup();
 	});
 
@@ -276,5 +321,37 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 		if (repo.mutationDepth === 0) {
 			void scan("tool-result");
 		}
+	});
+
+	pi.registerCommand("external-watch", {
+		description: "Control the external git change watcher: /external-watch status|on|off|rescan",
+		handler: async (args, ctx) => {
+			const action = args.trim().toLowerCase() || "status";
+			if (action === "status") {
+				ctx.ui.notify(statusText(repo), "info");
+				return;
+			}
+			if (!repo) {
+				ctx.ui.notify("external-git-watch is not active in this session", "warning");
+				return;
+			}
+			if (action === "on") {
+				await setEnabled(true, ctx);
+				ctx.ui.notify("external-git-watch enabled", "success");
+				return;
+			}
+			if (action === "off") {
+				await setEnabled(false, ctx);
+				ctx.ui.notify("external-git-watch disabled", "warning");
+				return;
+			}
+			if (action === "rescan") {
+				await refreshBaseline();
+				await scan("manual-rescan");
+				ctx.ui.notify("external-git-watch rescanned", "info");
+				return;
+			}
+			ctx.ui.notify("Usage: /external-watch status|on|off|rescan", "warning");
+		},
 	});
 }
