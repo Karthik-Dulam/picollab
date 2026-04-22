@@ -1,58 +1,39 @@
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
-import { createHash } from "node:crypto";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { renderDiff } from "@mariozechner/pi-coding-agent";
-import { Box, Container, Spacer, Text } from "@mariozechner/pi-tui";
+import { Box, Spacer, Text } from "@mariozechner/pi-tui";
 
 const POLL_INTERVAL_MS = 1000;
 const DEBOUNCE_MS = 250;
-const MAX_DIFF_CHARS = 40_000;
 const MUTATION_TOOLS = new Set(["edit", "write", "bash"]);
 
 type Snapshot = Map<string, string>;
 
-type ExternalChangeMessageDetails = {
+type ExternalEditMessageDetails = {
 	repoRoot: string;
-	files: string[];
-	diff: string;
-	truncated: boolean;
+	filePath: string;
 	source: "external";
 	detectedAt: number;
-};
-
-type PendingExternalChange = {
-	details: ExternalChangeMessageDetails;
-	signature: string;
-	snapshot: Snapshot;
 };
 
 type RepoSnapshot = {
 	root: string;
 	trackedFiles: string[];
 	baseline: Snapshot;
-	lastSignature: string | undefined;
-	pending: PendingExternalChange | undefined;
 	watcher: fs.FSWatcher | undefined;
 	poller: NodeJS.Timeout | undefined;
 	debounceTimer: NodeJS.Timeout | undefined;
 	scanning: boolean;
 	queuedScan: boolean;
-	agentActive: boolean;
 	mutationDepth: number;
 	mutationCallIds: Set<string>;
 	ready: boolean;
 	enabled: boolean;
-	lastNoticeAt: number;
 };
 
 function trimTrailingNewline(text: string): string {
 	return text.replace(/\n+$/g, "");
-}
-
-function uniqueSorted(values: string[]): string[] {
-	return [...new Set(values)].sort((a, b) => a.localeCompare(b));
 }
 
 async function runGit(pi: ExtensionAPI, cwd: string, args: string[]): Promise<string | undefined> {
@@ -86,137 +67,222 @@ async function readSnapshot(root: string, files: string[]): Promise<Snapshot> {
 	return new Map(entries);
 }
 
-async function renderFileDiff(
-	pi: ExtensionAPI,
-	root: string,
-	filePath: string,
-	oldText: string,
-	newText: string,
-): Promise<string> {
-	if (oldText === newText) return "";
-
-	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-external-git-watch-"));
-	const oldFile = path.join(tmpDir, "old.txt");
-	const newFile = path.join(tmpDir, "new.txt");
-
-	try {
-		fs.writeFileSync(oldFile, oldText, "utf8");
-		fs.writeFileSync(newFile, newText, "utf8");
-
-		const result = await pi.exec(
-			"git",
-			["diff", "--no-index", "--no-ext-diff", "--unified=4", "--", oldFile, newFile],
-			{ cwd: root, timeout: 15_000 },
-		);
-
-		if (result.code !== 0 && result.code !== 1) {
-			return "";
-		}
-
-		let diff = trimTrailingNewline(result.stdout || result.stderr || "");
-		if (!diff) return "";
-
-		diff = diff.replace(/^diff --git .*$/m, `diff --git a/${filePath} b/${filePath}`);
-		diff = diff.replace(/^--- .*$/m, `--- a/${filePath}`);
-		diff = diff.replace(/^\+\+\+ .*$/m, `+++ b/${filePath}`);
-		return diff;
-	} finally {
-		fs.rmSync(tmpDir, { recursive: true, force: true });
-	}
-}
-
-function hashText(text: string): string {
-	return createHash("sha256").update(text).digest("hex");
-}
-
 function statusText(repo: RepoSnapshot | undefined): string {
-	if (!repo) return "external-git-watch: inactive";
-	if (!repo.enabled) return `external-git-watch: disabled (${repo.root})`;
-	return `external-git-watch: watching ${repo.root}`;
+	if (!repo) return "external-watch: inactive";
+	if (!repo.enabled) return `external-watch: disabled (${repo.root})`;
+	return `external-watch: watching ${repo.root}`;
 }
 
-function makeSignature(details: ExternalChangeMessageDetails): string {
-	return hashText([details.repoRoot, details.files.join("\0"), details.diff].join("\0"));
+type DiffPart = {
+	value: string;
+	added?: boolean;
+	removed?: boolean;
+};
+
+function splitContentLines(text: string): string[] {
+	const lines = text.split("\n");
+	if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+	return lines;
 }
 
-async function computeWorkspaceChange(
-	pi: ExtensionAPI,
-	root: string,
-	trackedFiles: string[],
-	baseline: Snapshot,
-): Promise<PendingExternalChange | undefined> {
-	const current = await readSnapshot(root, trackedFiles);
-	const changedFiles: string[] = [];
-	const diffs: string[] = [];
+function diffLineParts(oldContent: string, newContent: string): DiffPart[] {
+	const oldLines = splitContentLines(oldContent);
+	const newLines = splitContentLines(newContent);
+	const rows = oldLines.length + 1;
+	const cols = newLines.length + 1;
+	const dp = Array.from({ length: rows }, () => Array<number>(cols).fill(0));
 
-	for (const filePath of trackedFiles) {
-		const oldText = baseline.get(filePath) ?? "";
-		const newText = current.get(filePath) ?? "";
-		if (oldText === newText) continue;
-
-		const diff = await renderFileDiff(pi, root, filePath, oldText, newText);
-		if (diff) {
-			changedFiles.push(filePath);
-			diffs.push(diff);
+	for (let i = oldLines.length - 1; i >= 0; i--) {
+		for (let j = newLines.length - 1; j >= 0; j--) {
+			dp[i][j] = oldLines[i] === newLines[j]
+				? dp[i + 1][j + 1] + 1
+				: Math.max(dp[i + 1][j], dp[i][j + 1]);
 		}
 	}
 
-	if (changedFiles.length === 0) return undefined;
-
-	const combinedDiff = trimTrailingNewline(diffs.join("\n\n"));
-	const truncated = combinedDiff.length > MAX_DIFF_CHARS;
-	const diff = truncated ? `${combinedDiff.slice(0, MAX_DIFF_CHARS)}\n\n... [diff truncated]` : combinedDiff;
-	const details: ExternalChangeMessageDetails = {
-		repoRoot: root,
-		files: uniqueSorted(changedFiles),
-		diff,
-		truncated,
-		source: "external",
-		detectedAt: Date.now(),
+	const parts: Array<{ lines: string[]; added?: boolean; removed?: boolean }> = [];
+	const push = (line: string, added?: boolean, removed?: boolean) => {
+		const last = parts[parts.length - 1];
+		if (last && last.added === added && last.removed === removed) {
+			last.lines.push(line);
+			return;
+		}
+		parts.push({ lines: [line], added, removed });
 	};
 
-	return {
-		details,
-		signature: makeSignature(details),
-		snapshot: current,
-	};
+	let i = 0;
+	let j = 0;
+	while (i < oldLines.length && j < newLines.length) {
+		if (oldLines[i] === newLines[j]) {
+			push(oldLines[i]);
+			i++;
+			j++;
+			continue;
+		}
+		if (dp[i + 1][j] >= dp[i][j + 1]) {
+			push(oldLines[i], false, true);
+			i++;
+		} else {
+			push(newLines[j], true, false);
+			j++;
+		}
+	}
+	while (i < oldLines.length) {
+		push(oldLines[i], false, true);
+		i++;
+	}
+	while (j < newLines.length) {
+		push(newLines[j], true, false);
+		j++;
+	}
+
+	return parts.map((part) => ({
+		value: `${part.lines.join("\n")}\n`,
+		added: part.added,
+		removed: part.removed,
+	}));
 }
 
-function renderExternalChangeMessage(content: string, theme: any, expanded: boolean): Box {
-	const lines = content.split("\n");
-	const additions = lines.filter((line) => line.startsWith("+") && !line.startsWith("+++"));
-	const removals = lines.filter((line) => line.startsWith("-") && !line.startsWith("---"));
-	const rendered = renderDiff(content).split("\n");
-	const previewLines = expanded ? 30 : 8;
+function generateDiffString(oldContent: string, newContent: string, contextLines = 4): { diff: string; firstChangedLine?: number } {
+	const parts = diffLineParts(oldContent, newContent);
+	const output: string[] = [];
+	const oldLines = oldContent.split("\n");
+	const newLines = newContent.split("\n");
+	const maxLineNum = Math.max(oldLines.length, newLines.length);
+	const lineNumWidth = String(maxLineNum).length;
+	let oldLineNum = 1;
+	let newLineNum = 1;
+	let lastWasChange = false;
+	let firstChangedLine: number | undefined;
 
-	const box = new Box(1, 1, (t: string) => theme.bg("customMessageBg", t));
-	const container = new Container();
+	for (let i = 0; i < parts.length; i++) {
+		const part = parts[i];
+		const raw = part.value.split("\n");
+		if (raw[raw.length - 1] === "") raw.pop();
 
-	let header = theme.fg("toolTitle", theme.bold("external git change"));
+		if (part.added || part.removed) {
+			if (firstChangedLine === undefined) firstChangedLine = newLineNum;
+			for (const line of raw) {
+				if (part.added) {
+					const lineNum = String(newLineNum).padStart(lineNumWidth, " ");
+					output.push(`+${lineNum} ${line}`);
+					newLineNum++;
+				} else {
+					const lineNum = String(oldLineNum).padStart(lineNumWidth, " ");
+					output.push(`-${lineNum} ${line}`);
+					oldLineNum++;
+				}
+			}
+			lastWasChange = true;
+			continue;
+		}
+
+		const nextPartIsChange = i < parts.length - 1 && (parts[i + 1].added || parts[i + 1].removed);
+		const hasLeadingChange = lastWasChange;
+		const hasTrailingChange = nextPartIsChange;
+
+		if (hasLeadingChange && hasTrailingChange) {
+			if (raw.length <= contextLines * 2) {
+				for (const line of raw) {
+					const lineNum = String(oldLineNum).padStart(lineNumWidth, " ");
+					output.push(` ${lineNum} ${line}`);
+					oldLineNum++;
+					newLineNum++;
+				}
+			} else {
+				const leadingLines = raw.slice(0, contextLines);
+				const trailingLines = raw.slice(raw.length - contextLines);
+				const skippedLines = raw.length - leadingLines.length - trailingLines.length;
+				for (const line of leadingLines) {
+					const lineNum = String(oldLineNum).padStart(lineNumWidth, " ");
+					output.push(` ${lineNum} ${line}`);
+					oldLineNum++;
+					newLineNum++;
+				}
+				output.push(` ${"".padStart(lineNumWidth, " ")} ...`);
+				oldLineNum += skippedLines;
+				newLineNum += skippedLines;
+				for (const line of trailingLines) {
+					const lineNum = String(oldLineNum).padStart(lineNumWidth, " ");
+					output.push(` ${lineNum} ${line}`);
+					oldLineNum++;
+					newLineNum++;
+				}
+			}
+		} else if (hasLeadingChange) {
+			const shownLines = raw.slice(0, contextLines);
+			const skippedLines = raw.length - shownLines.length;
+			for (const line of shownLines) {
+				const lineNum = String(oldLineNum).padStart(lineNumWidth, " ");
+				output.push(` ${lineNum} ${line}`);
+				oldLineNum++;
+				newLineNum++;
+			}
+			if (skippedLines > 0) {
+				output.push(` ${"".padStart(lineNumWidth, " ")} ...`);
+				oldLineNum += skippedLines;
+				newLineNum += skippedLines;
+			}
+		} else if (hasTrailingChange) {
+			const skippedLines = Math.max(0, raw.length - contextLines);
+			if (skippedLines > 0) {
+				output.push(` ${"".padStart(lineNumWidth, " ")} ...`);
+				oldLineNum += skippedLines;
+				newLineNum += skippedLines;
+			}
+			for (const line of raw.slice(skippedLines)) {
+				const lineNum = String(oldLineNum).padStart(lineNumWidth, " ");
+				output.push(` ${lineNum} ${line}`);
+				oldLineNum++;
+				newLineNum++;
+			}
+		} else {
+			oldLineNum += raw.length;
+			newLineNum += raw.length;
+		}
+
+		lastWasChange = false;
+	}
+
+	return { diff: output.join("\n"), firstChangedLine };
+}
+
+function countDiffLines(diff: string): { additions: number; removals: number } {
+	const lines = diff.split("\n");
+	let additions = 0;
+	let removals = 0;
+	for (const line of lines) {
+		if (line.startsWith("+")) additions++;
+		if (line.startsWith("-")) removals++;
+	}
+	return { additions, removals };
+}
+
+function buildEditLikeMessage(filePath: string, diff: string, theme: any, expanded: boolean): Box {
+	const box = new Box(0, 0, (text: string) => theme.bg("toolSuccessBg", text));
+	const { additions, removals } = countDiffLines(diff);
+	const rendered = renderDiff(diff).split("\n");
+	const previewLines = expanded ? rendered.length : Math.min(rendered.length, 8);
+
+	let header = theme.fg("toolTitle", theme.bold("edit"));
+	header += " ";
+	header += theme.fg("accent", filePath);
 	header += theme.fg("dim", "  ");
-	header += theme.fg("success", `+${additions.length}`);
+	header += theme.fg("success", `+${additions}`);
 	header += theme.fg("dim", " / ");
-	header += theme.fg("error", `-${removals.length}`);
-	container.addChild(new Text(header, 0, 0));
+	header += theme.fg("error", `-${removals}`);
 
-	if (rendered.length > 0) {
-		container.addChild(new Spacer(1));
-		for (const line of rendered.slice(0, previewLines)) {
-			container.addChild(new Text(line, 0, 0));
-		}
-		if (rendered.length > previewLines) {
-			container.addChild(new Spacer(1));
-			container.addChild(
-				new Text(
-					theme.fg("muted", expanded ? `... ${rendered.length - previewLines} more diff lines` : "expand for full diff"),
-					0,
-					0,
-				),
-			);
+	box.addChild(new Text(header, 0, 0));
+
+	if (previewLines > 0) {
+		box.addChild(new Spacer(1));
+		box.addChild(new Text(rendered.slice(0, previewLines).join("\n"), 0, 0));
+		if (!expanded && rendered.length > previewLines) {
+			box.addChild(new Spacer(1));
+			box.addChild(new Text(theme.fg("muted", "expand for full diff"), 0, 0));
 		}
 	}
 
-	box.addChild(container);
 	return box;
 }
 
@@ -242,13 +308,11 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 	const refreshBaseline = async () => {
 		if (!repo) return;
 		repo.baseline = await readSnapshot(repo.root, repo.trackedFiles);
-		repo.lastSignature = undefined;
-		repo.pending = undefined;
 	};
 
 	const updateStatus = (ctx?: any) => {
 		if (!ctx?.ui) return;
-		ctx.ui.setStatus("external-git-watch", statusText(repo));
+		ctx.ui.setStatus("external-watch", statusText(repo));
 	};
 
 	const setEnabled = async (enabled: boolean, ctx?: any) => {
@@ -280,31 +344,46 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 					continue;
 				}
 
-				const pending = await computeWorkspaceChange(pi, repo.root, repo.trackedFiles, repo.baseline);
-				if (!pending) continue;
-				if (pending.signature === repo.lastSignature) continue;
+				const current = await readSnapshot(repo.root, repo.trackedFiles);
 
-				repo.lastSignature = pending.signature;
-				repo.pending = pending;
+				for (const filePath of repo.trackedFiles) {
+					const oldText = repo.baseline.get(filePath) ?? "";
+					const newText = current.get(filePath) ?? "";
+					if (oldText === newText) continue;
 
-				pi.sendMessage(
-					{
-						customType: "external-git-change",
-						content: pending.details.diff,
-						display: true,
-						details: pending.details,
-					},
-					{ deliverAs: "steer" },
-				);
+					const generated = generateDiffString(oldText, newText);
+					if (!generated.diff) continue;
+
+					const details: ExternalEditMessageDetails = {
+						repoRoot: repo.root,
+						filePath,
+						source: "external",
+						detectedAt: Date.now(),
+					};
+
+					pi.sendMessage(
+						{
+							customType: "external-edit",
+							content: generated.diff,
+							display: true,
+							details,
+						},
+						{ deliverAs: "steer" },
+					);
+				}
+
+				repo.baseline = current;
 			} while (repo.queuedScan);
 		} finally {
 			repo.scanning = false;
 		}
 	};
 
-	pi.registerMessageRenderer("external-git-change", (message, { expanded }, theme) => {
+	pi.registerMessageRenderer("external-edit", (message, { expanded }, theme) => {
 		const content = typeof message.content === "string" ? message.content : "";
-		return renderExternalChangeMessage(content, theme, expanded);
+		const details = message.details as ExternalEditMessageDetails | undefined;
+		const filePath = details?.filePath ?? "(unknown file)";
+		return buildEditLikeMessage(filePath, content, theme, expanded);
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -312,8 +391,8 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 
 		const root = await findRepoRoot(pi, ctx.cwd);
 		if (!root) {
-			ctx.ui.notify("external-git-watch disabled: current directory is not a git repo", "warning");
-			ctx.ui.setStatus("external-git-watch", "external-git-watch: inactive");
+			ctx.ui.notify("external-watch disabled: current directory is not a git repo", "warning");
+			ctx.ui.setStatus("external-watch", "external-watch: inactive");
 			return;
 		}
 
@@ -322,19 +401,15 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 			root,
 			trackedFiles,
 			baseline: await readSnapshot(root, trackedFiles),
-			lastSignature: undefined,
-			pending: undefined,
 			watcher: undefined,
 			poller: undefined,
 			debounceTimer: undefined,
 			scanning: false,
 			queuedScan: false,
-			agentActive: false,
 			mutationDepth: 0,
 			mutationCallIds: new Set<string>(),
 			ready: false,
 			enabled: true,
-			lastNoticeAt: 0,
 		};
 
 		repo.ready = true;
@@ -352,44 +427,16 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 				void scan("poll");
 			}, POLL_INTERVAL_MS);
 		} catch {
-			// Ignore poller setup failures; scan on agent events still works.
+			// Ignore poller setup failures.
 		}
 
-		ctx.ui.setStatus("external-git-watch", statusText(repo));
-		ctx.ui.notify(`external-git-watch active in ${root}`, "info");
+		ctx.ui.setStatus("external-watch", statusText(repo));
+		ctx.ui.notify(`external-watch active in ${root}`, "info");
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		ctx.ui.setStatus("external-git-watch", "external-git-watch: inactive");
+		ctx.ui.setStatus("external-watch", "external-watch: inactive");
 		cleanup();
-	});
-
-	pi.on("context", async (event, _ctx) => {
-		if (!repo?.pending) return { messages: event.messages };
-		const pending = repo.pending;
-		repo.pending = undefined;
-		repo.baseline = pending.snapshot;
-		repo.lastSignature = pending.signature;
-		return {
-			messages: [
-				...event.messages,
-				{
-					role: "custom",
-					customType: "external-git-change",
-					content: pending.details.diff,
-					display: false,
-					details: pending.details,
-				},
-			],
-		};
-	});
-
-	pi.on("agent_start", async () => {
-		if (repo) repo.agentActive = true;
-	});
-
-	pi.on("agent_end", async () => {
-		if (repo) repo.agentActive = false;
 	});
 
 	pi.on("tool_execution_start", async (event) => {
@@ -416,7 +463,7 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("external-watch", {
-		description: "Control the external git change watcher: /external-watch status|on|off|rescan",
+		description: "Control the external watcher: /external-watch status|on|off|rescan",
 		handler: async (args, ctx) => {
 			const action = args.trim().toLowerCase() || "status";
 			if (action === "status") {
@@ -424,23 +471,22 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 				return;
 			}
 			if (!repo) {
-				ctx.ui.notify("external-git-watch is not active in this session", "warning");
+				ctx.ui.notify("external-watch is not active in this session", "warning");
 				return;
 			}
 			if (action === "on") {
 				await setEnabled(true, ctx);
-				ctx.ui.notify("external-git-watch enabled", "success");
+				ctx.ui.notify("external-watch enabled", "success");
 				return;
 			}
 			if (action === "off") {
 				await setEnabled(false, ctx);
-				ctx.ui.notify("external-git-watch disabled", "warning");
+				ctx.ui.notify("external-watch disabled", "warning");
 				return;
 			}
 			if (action === "rescan") {
 				await refreshBaseline();
-				await scan("manual-rescan");
-				ctx.ui.notify("external-git-watch rescanned", "info");
+				ctx.ui.notify("external-watch baseline refreshed", "info");
 				return;
 			}
 			ctx.ui.notify("Usage: /external-watch status|on|off|rescan", "warning");
