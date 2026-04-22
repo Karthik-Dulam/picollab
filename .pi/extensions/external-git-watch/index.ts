@@ -23,6 +23,8 @@ type RepoSnapshot = {
 	ready: boolean;
 	enabled: boolean;
 	lastNoticeAt: number;
+	pending: ExternalChangeMessageDetails[];
+	delivered: Set<string>;
 };
 
 type ExternalChangeMessageDetails = {
@@ -113,6 +115,39 @@ function statusText(repo: RepoSnapshot | undefined): string {
 	return `external-git-watch: watching ${repo.root}`;
 }
 
+function changeSignature(details: ExternalChangeMessageDetails): string {
+	return createHash("sha256")
+		.update(details.repoRoot)
+		.update("\0")
+		.update(details.files.join("\0"))
+		.update("\0")
+		.update(details.diff)
+		.digest("hex");
+}
+
+function messageText(detailsList: ExternalChangeMessageDetails[]): string {
+	const fileLines = uniqueSorted(detailsList.flatMap((details) => details.files)).map((file) => `- ${file}`);
+	const diffBlock = detailsList
+		.map((details) => details.diff)
+		.filter(Boolean)
+		.join("\n\n");
+	const first = detailsList[0];
+	const truncated = detailsList.some((details) => details.truncated);
+	return [
+		"External git change detected outside pi.",
+		"Likely source: user, script, or another agent.",
+		"",
+		"Changed files:",
+		fileLines.length > 0 ? fileLines.join("\n") : "- (no tracked files detected)",
+		"",
+		"Unified diff:",
+		"```diff",
+		diffBlock || "(no diff text available)",
+		"```",
+		truncated ? "\nNote: diff was truncated to keep the context manageable." : "",
+	].join("\n");
+}
+
 export default function externalGitWatchExtension(pi: ExtensionAPI) {
 	let repo: RepoSnapshot | undefined;
 
@@ -137,6 +172,31 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 		const diffPayload = await getDiffPayload(pi, repo.root);
 		const signature = createHash("sha256").update(diffPayload.files.join("\0")).update("\0").update(diffPayload.diff).digest("hex");
 		repo.lastSignature = signature;
+	};
+
+	const queueChange = (details: ExternalChangeMessageDetails) => {
+		if (!repo) return;
+		const signature = changeSignature(details);
+		if (repo.delivered.has(signature)) return;
+		if (repo.pending.some((item) => changeSignature(item) === signature)) return;
+		repo.pending.push(details);
+	};
+
+	const flushPendingIntoContext = () => {
+		if (!repo || repo.pending.length === 0) return undefined;
+		const pending = repo.pending.filter((details) => {
+			const signature = changeSignature(details);
+			return !repo.delivered.has(signature);
+		});
+		if (pending.length === 0) {
+			repo.pending = [];
+			return undefined;
+		}
+		for (const details of pending) {
+			repo.delivered.add(changeSignature(details));
+		}
+		repo.pending = [];
+		return pending;
 	};
 
 	const updateStatus = (ctx?: any) => {
@@ -205,15 +265,19 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 					detectedAt: Date.now(),
 				};
 
-				pi.sendMessage(
-					{
-						customType: "external-git-change",
-						content: buildMessage(details),
-						display: true,
-						details,
-					},
-					{ deliverAs: "steer", triggerTurn: true },
-				);
+				queueChange(details);
+
+				if (repo.agentActive) {
+					pi.sendMessage(
+						{
+							customType: "external-git-change",
+							content: messageText([details]),
+							display: true,
+							details,
+						},
+						{ deliverAs: "steer", triggerTurn: true },
+					);
+				}
 			} while (repo.queuedScan);
 		} finally {
 			repo.scanning = false;
@@ -260,6 +324,8 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 			ready: false,
 			enabled: true,
 			lastNoticeAt: 0,
+			pending: [],
+			delivered: new Set<string>(),
 		};
 
 		await refreshBaseline();
@@ -289,6 +355,23 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (_event, ctx) => {
 		ctx.ui.setStatus("external-git-watch", "external-git-watch: inactive");
 		cleanup();
+	});
+
+	pi.on("context", async (event, _ctx) => {
+		const pending = flushPendingIntoContext();
+		if (!pending || pending.length === 0) {
+			return { messages: event.messages };
+		}
+
+		const injected = {
+			role: "custom",
+			customType: "external-git-change",
+			content: messageText(pending),
+			display: true,
+			details: pending,
+		};
+
+		return { messages: [...event.messages, injected] };
 	});
 
 	pi.on("agent_start", async () => {
