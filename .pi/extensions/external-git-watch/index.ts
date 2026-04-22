@@ -205,7 +205,6 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 					detectedAt: Date.now(),
 				};
 
-				const deliverAs = repo.agentActive ? "steer" : "nextTurn";
 				pi.sendMessage(
 					{
 						customType: "external-git-change",
@@ -213,7 +212,7 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 						display: true,
 						details,
 					},
-					{ deliverAs },
+					{ deliverAs: "steer", triggerTurn: true },
 				);
 			} while (repo.queuedScan);
 		} finally {
