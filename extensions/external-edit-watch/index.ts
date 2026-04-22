@@ -68,14 +68,32 @@ async function readSnapshot(root: string, files: string[]): Promise<Snapshot> {
 	return new Map(entries);
 }
 
+async function refreshTrackedFiles(pi: ExtensionAPI, repo: RepoSnapshot): Promise<void> {
+	const trackedFiles = await getTrackedFiles(pi, repo.root);
+	const currentTracked = new Set(trackedFiles);
+	const previousTracked = new Set(repo.trackedFiles);
+
+	for (const filePath of trackedFiles) {
+		if (previousTracked.has(filePath)) continue;
+		repo.baseline.set(filePath, await readTextFile(path.join(repo.root, filePath)));
+	}
+
+	for (const filePath of repo.trackedFiles) {
+		if (currentTracked.has(filePath)) continue;
+		repo.baseline.delete(filePath);
+	}
+
+	repo.trackedFiles = trackedFiles;
+}
+
 function statusText(repo: RepoSnapshot | undefined, theme?: any): string | undefined {
 	if (!repo) return undefined;
 	if (!theme) {
-		if (!repo.enabled) return "◌ ext";
-		return "● ext";
+		if (!repo.enabled) return "◌ collab";
+		return "● collab";
 	}
-	if (!repo.enabled) return theme.fg("dim", "◌ ext");
-	return theme.fg("accent", "●") + theme.fg("dim", " ext");
+	if (!repo.enabled) return theme.fg("dim", "◌ collab");
+	return theme.fg("accent", "●") + theme.fg("dim", " collab");
 }
 
 type DiffPart = {
@@ -319,6 +337,7 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 
 	const refreshBaseline = async () => {
 		if (!repo) return;
+		await refreshTrackedFiles(pi, repo);
 		repo.baseline = await readSnapshot(repo.root, repo.trackedFiles);
 	};
 
@@ -356,6 +375,7 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 					continue;
 				}
 
+				await refreshTrackedFiles(pi, repo);
 				const current = await readSnapshot(repo.root, repo.trackedFiles);
 
 				for (const filePath of repo.trackedFiles) {
