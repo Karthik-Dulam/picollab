@@ -23,8 +23,6 @@ type RepoSnapshot = {
 	ready: boolean;
 	enabled: boolean;
 	lastNoticeAt: number;
-	pending: ExternalChangeMessageDetails[];
-	delivered: Set<string>;
 };
 
 type ExternalChangeMessageDetails = {
@@ -131,7 +129,6 @@ function messageText(detailsList: ExternalChangeMessageDetails[]): string {
 		.map((details) => details.diff)
 		.filter(Boolean)
 		.join("\n\n");
-	const first = detailsList[0];
 	const truncated = detailsList.some((details) => details.truncated);
 	return [
 		"External git change detected outside pi.",
@@ -141,10 +138,18 @@ function messageText(detailsList: ExternalChangeMessageDetails[]): string {
 		fileLines.length > 0 ? fileLines.join("\n") : "- (no tracked files detected)",
 		"",
 		"Unified diff:",
-		"```diff",
 		diffBlock || "(no diff text available)",
-		"```",
 		truncated ? "\nNote: diff was truncated to keep the context manageable." : "",
+	].join("\n");
+}
+
+function metaText(detailsList: ExternalChangeMessageDetails[]): string {
+	const files = uniqueSorted(detailsList.flatMap((details) => details.files));
+	const source = detailsList.length === 1 ? detailsList[0]!.source : "external";
+	return [
+		`External git change detected outside pi.`,
+		`Source: ${source}.`,
+		files.length > 0 ? `Files: ${files.join(", ")}` : "Files: (none)",
 	].join("\n");
 }
 
@@ -174,30 +179,6 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 		repo.lastSignature = signature;
 	};
 
-	const queueChange = (details: ExternalChangeMessageDetails) => {
-		if (!repo) return;
-		const signature = changeSignature(details);
-		if (repo.delivered.has(signature)) return;
-		if (repo.pending.some((item) => changeSignature(item) === signature)) return;
-		repo.pending.push(details);
-	};
-
-	const flushPendingIntoContext = () => {
-		if (!repo || repo.pending.length === 0) return undefined;
-		const pending = repo.pending.filter((details) => {
-			const signature = changeSignature(details);
-			return !repo.delivered.has(signature);
-		});
-		if (pending.length === 0) {
-			repo.pending = [];
-			return undefined;
-		}
-		for (const details of pending) {
-			repo.delivered.add(changeSignature(details));
-		}
-		repo.pending = [];
-		return pending;
-	};
 
 	const updateStatus = (ctx?: any) => {
 		if (!ctx?.ui) return;
@@ -265,19 +246,24 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 					detectedAt: Date.now(),
 				};
 
-				queueChange(details);
-				const detailSignature = changeSignature(details);
-				repo.delivered.add(detailSignature);
-				repo.pending = repo.pending.filter((item) => changeSignature(item) !== detailSignature);
+				pi.sendMessage(
+					{
+						customType: "external-git-change-meta",
+						content: metaText([details]),
+						display: false,
+						details,
+					},
+					{ deliverAs: "steer" },
+				);
 
 				pi.sendMessage(
 					{
 						customType: "external-git-change",
-						content: messageText([details]),
+						content: details.diff,
 						display: true,
 						details,
 					},
-					{ deliverAs: "steer", triggerTurn: true },
+					{ deliverAs: "steer" },
 				);
 			} while (repo.queuedScan);
 		} finally {
@@ -285,25 +271,9 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 		}
 	};
 
-	pi.registerMessageRenderer("external-git-change", (message, { expanded }, theme) => {
-		const details = message.details as ExternalChangeMessageDetails | undefined;
-		const header = theme.fg("warning", theme.bold("[external git change]"));
-		let text = `${header} ${details?.files.length ?? 0} tracked file(s) changed outside pi`;
-
-		if (details?.files?.length) {
-			text += `\n${theme.fg("muted", details.files.join(", "))}`;
-		}
-
-		if (details?.diff) {
-			const rendered = renderDiff(details.diff).split("\n");
-			const preview = expanded ? rendered : rendered.slice(0, 14);
-			text += `\n\n${preview.join("\n")}`;
-			if (!expanded && rendered.length > preview.length) {
-				text += `\n${theme.fg("muted", `... ${rendered.length - preview.length} more lines`)}`;
-			}
-		}
-
-		return new Text(text, 0, 0);
+	pi.registerMessageRenderer("external-git-change", (message, _options, _theme) => {
+		const content = typeof message.content === "string" ? message.content : "";
+		return new Text(renderDiff(content), 0, 0);
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -330,8 +300,6 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 			ready: false,
 			enabled: true,
 			lastNoticeAt: 0,
-			pending: [],
-			delivered: new Set<string>(),
 		};
 
 		await refreshBaseline();
@@ -361,23 +329,6 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (_event, ctx) => {
 		ctx.ui.setStatus("external-git-watch", "external-git-watch: inactive");
 		cleanup();
-	});
-
-	pi.on("context", async (event, _ctx) => {
-		const pending = flushPendingIntoContext();
-		if (!pending || pending.length === 0) {
-			return { messages: event.messages };
-		}
-
-		const injected = {
-			role: "custom",
-			customType: "external-git-change",
-			content: messageText(pending),
-			display: true,
-			details: pending,
-		};
-
-		return { messages: [...event.messages, injected] };
 	});
 
 	pi.on("agent_start", async () => {
