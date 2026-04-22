@@ -266,18 +266,19 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 				};
 
 				queueChange(details);
+				const signature = changeSignature(details);
+				repo.delivered.add(signature);
+				repo.pending = repo.pending.filter((item) => changeSignature(item) !== signature);
 
-				if (repo.agentActive) {
-					pi.sendMessage(
-						{
-							customType: "external-git-change",
-							content: messageText([details]),
-							display: true,
-							details,
-						},
-						{ deliverAs: "steer", triggerTurn: true },
-					);
-				}
+				pi.sendMessage(
+					{
+						customType: "external-git-change",
+						content: messageText([details]),
+						display: true,
+						details,
+					},
+					repo.agentActive ? { deliverAs: "steer", triggerTurn: true } : { deliverAs: "nextTurn" },
+				);
 			} while (repo.queuedScan);
 		} finally {
 			repo.scanning = false;
