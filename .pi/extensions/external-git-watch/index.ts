@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { renderDiff } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import { Box, Text } from "@mariozechner/pi-tui";
 import { createHash } from "node:crypto";
 
 const POLL_INTERVAL_MS = 1000;
@@ -224,7 +224,7 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 						display: true,
 						details,
 					},
-					{ deliverAs: "nextTurn" },
+					{ deliverAs: "steer" },
 				);
 			} while (repo.queuedScan);
 		} finally {
@@ -246,7 +246,9 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 			text += `\n\n${renderDiff(content)}`;
 		}
 
-		return new Text(text, 0, 0);
+		const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
+		box.addChild(new Text(text, 0, 0));
+		return box;
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
