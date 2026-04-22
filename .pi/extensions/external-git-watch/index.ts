@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { renderDiff } from "@mariozechner/pi-coding-agent";
-import { Box, Text } from "@mariozechner/pi-tui";
+import { Box, Container, Spacer, Text } from "@mariozechner/pi-tui";
 import { createHash } from "node:crypto";
 
 const POLL_INTERVAL_MS = 1000;
@@ -111,16 +111,6 @@ function statusText(repo: RepoSnapshot | undefined): string {
 	if (!repo) return "external-git-watch: inactive";
 	if (!repo.enabled) return `external-git-watch: disabled (${repo.root})`;
 	return `external-git-watch: watching ${repo.root}`;
-}
-
-function changeSignature(details: ExternalChangeMessageDetails): string {
-	return createHash("sha256")
-		.update(details.repoRoot)
-		.update("\0")
-		.update(details.files.join("\0"))
-		.update("\0")
-		.update(details.diff)
-		.digest("hex");
 }
 
 
@@ -234,20 +224,29 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 
 	pi.registerMessageRenderer("external-git-change", (message, { expanded }, theme) => {
 		const content = typeof message.content === "string" ? message.content : "";
-		const additions = (content.match(/^\+/gm) ?? []).length;
-		const removals = (content.match(/^-/gm) ?? []).length;
+		const lines = content.split("\n");
+		const additions = lines.filter((line) => line.startsWith("+") && !line.startsWith("+++"));
+		const removals = lines.filter((line) => line.startsWith("-") && !line.startsWith("---"));
+
 		let text = theme.fg("toolTitle", theme.bold("external git change"));
 		text += theme.fg("dim", "  ");
-		text += theme.fg("success", `+${additions}`);
+		text += theme.fg("success", `+${additions.length}`);
 		text += theme.fg("dim", " / ");
-		text += theme.fg("error", `-${removals}`);
+		text += theme.fg("error", `-${removals.length}`);
 
 		if (expanded) {
-			text += `\n\n${renderDiff(content)}`;
+			const rendered = renderDiff(content).split("\n");
+			const preview = rendered.slice(0, 30);
+			text += `\n\n${preview.join("\n")}`;
+			if (rendered.length > preview.length) {
+				text += `\n${theme.fg("muted", `... ${rendered.length - preview.length} more diff lines`)}`;
+			}
 		}
 
 		const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
-		box.addChild(new Text(text, 0, 0));
+		const container = new Container();
+		container.addChild(new Text(text, 0, 0));
+		box.addChild(container);
 		return box;
 	});
 
