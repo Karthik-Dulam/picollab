@@ -277,7 +277,7 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 						display: true,
 						details,
 					},
-					repo.agentActive ? { deliverAs: "steer", triggerTurn: true } : { deliverAs: "nextTurn" },
+					{ deliverAs: "steer", triggerTurn: true },
 				);
 			} while (repo.queuedScan);
 		} finally {
@@ -294,8 +294,13 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 			text += `\n${theme.fg("muted", details.files.join(", "))}`;
 		}
 
-		if (expanded && details?.diff) {
-			text += `\n\n${renderDiff(details.diff)}`;
+		if (details?.diff) {
+			const rendered = renderDiff(details.diff).split("\n");
+			const preview = expanded ? rendered : rendered.slice(0, 14);
+			text += `\n\n${preview.join("\n")}`;
+			if (!expanded && rendered.length > preview.length) {
+				text += `\n${theme.fg("muted", `... ${rendered.length - preview.length} more lines`)}`;
+			}
 		}
 
 		return new Text(text, 0, 0);
