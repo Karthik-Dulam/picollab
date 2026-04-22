@@ -228,24 +228,27 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 		const additions = lines.filter((line) => line.startsWith("+") && !line.startsWith("+++"));
 		const removals = lines.filter((line) => line.startsWith("-") && !line.startsWith("---"));
 
-		let text = theme.fg("toolTitle", theme.bold("external git change"));
-		text += theme.fg("dim", "  ");
-		text += theme.fg("success", `+${additions.length}`);
-		text += theme.fg("dim", " / ");
-		text += theme.fg("error", `-${removals.length}`);
+		const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
+		const container = new Container();
+
+		let header = theme.fg("toolTitle", theme.bold("external git change"));
+		header += theme.fg("dim", "  ");
+		header += theme.fg("success", `+${additions.length}`);
+		header += theme.fg("dim", " / ");
+		header += theme.fg("error", `-${removals.length}`);
+		container.addChild(new Text(header, 0, 0));
 
 		if (expanded) {
 			const rendered = renderDiff(content).split("\n");
-			const preview = rendered.slice(0, 30);
-			text += `\n\n${preview.join("\n")}`;
-			if (rendered.length > preview.length) {
-				text += `\n${theme.fg("muted", `... ${rendered.length - preview.length} more diff lines`)}`;
+			container.addChild(new Spacer(1));
+			for (const line of rendered.slice(0, 30)) {
+				container.addChild(new Text(line, 0, 0));
+			}
+			if (rendered.length > 30) {
+				container.addChild(new Text(theme.fg("muted", `... ${rendered.length - 30} more diff lines`), 0, 0));
 			}
 		}
 
-		const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
-		const container = new Container();
-		container.addChild(new Text(text, 0, 0));
 		box.addChild(container);
 		return box;
 	});
