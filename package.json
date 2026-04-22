@@ -1,0 +1,14 @@
+{
+  "name": "pi-external-edit-watch",
+  "version": "0.1.0",
+  "description": "Pi extension that detects external edits to git-tracked files and injects edit-style diffs into the session.",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  }
+}
