@@ -186,6 +186,8 @@ function renderExternalChangeMessage(content: string, theme: any, expanded: bool
 	const lines = content.split("\n");
 	const additions = lines.filter((line) => line.startsWith("+") && !line.startsWith("+++"));
 	const removals = lines.filter((line) => line.startsWith("-") && !line.startsWith("---"));
+	const rendered = renderDiff(content).split("\n");
+	const previewLines = expanded ? 30 : 8;
 
 	const box = new Box(1, 1, (t: string) => theme.bg("customMessageBg", t));
 	const container = new Container();
@@ -197,14 +199,20 @@ function renderExternalChangeMessage(content: string, theme: any, expanded: bool
 	header += theme.fg("error", `-${removals.length}`);
 	container.addChild(new Text(header, 0, 0));
 
-	if (expanded) {
-		const rendered = renderDiff(content).split("\n");
+	if (rendered.length > 0) {
 		container.addChild(new Spacer(1));
-		for (const line of rendered.slice(0, 30)) {
+		for (const line of rendered.slice(0, previewLines)) {
 			container.addChild(new Text(line, 0, 0));
 		}
-		if (rendered.length > 30) {
-			container.addChild(new Text(theme.fg("muted", `... ${rendered.length - 30} more diff lines`), 0, 0));
+		if (rendered.length > previewLines) {
+			container.addChild(new Spacer(1));
+			container.addChild(
+				new Text(
+					theme.fg("muted", expanded ? `... ${rendered.length - previewLines} more diff lines` : "expand for full diff"),
+					0,
+					0,
+				),
+			);
 		}
 	}
 
@@ -278,6 +286,16 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 
 				repo.lastSignature = pending.signature;
 				repo.pending = pending;
+
+				pi.sendMessage(
+					{
+						customType: "external-git-change",
+						content: pending.details.diff,
+						display: true,
+						details: pending.details,
+					},
+					{ deliverAs: "steer" },
+				);
 			} while (repo.queuedScan);
 		} finally {
 			repo.scanning = false;
@@ -359,7 +377,7 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 					role: "custom",
 					customType: "external-git-change",
 					content: pending.details.diff,
-					display: true,
+					display: false,
 					details: pending.details,
 				},
 			],
