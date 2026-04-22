@@ -1,5 +1,5 @@
 {
-  "name": "pi-external-edit-watch",
+  "name": "picollab",
   "version": "0.1.0",
   "description": "Pi extension that detects external edits to git-tracked files and injects edit-style diffs into the session.",
   "keywords": ["pi-package"],
