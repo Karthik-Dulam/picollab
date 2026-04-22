@@ -259,12 +259,12 @@ function countDiffLines(diff: string): { additions: number; removals: number } {
 }
 
 function buildEditLikeMessage(filePath: string, diff: string, theme: any, expanded: boolean): Box {
-	const box = new Box(0, 0, (text: string) => theme.bg("toolSuccessBg", text));
+	const box = new Box(1, 1, (text: string) => theme.bg("customMessageBg", text));
 	const { additions, removals } = countDiffLines(diff);
 	const rendered = renderDiff(diff).split("\n");
-	const previewLines = expanded ? rendered.length : Math.min(rendered.length, 8);
+	const previewLines = expanded ? rendered.length : Math.min(rendered.length, 20);
 
-	let header = theme.fg("toolTitle", theme.bold("edit"));
+	let header = theme.fg("customMessageLabel", theme.bold("external edit"));
 	header += " ";
 	header += theme.fg("accent", filePath);
 	header += theme.fg("dim", "  ");
@@ -279,7 +279,7 @@ function buildEditLikeMessage(filePath: string, diff: string, theme: any, expand
 		box.addChild(new Text(rendered.slice(0, previewLines).join("\n"), 0, 0));
 		if (!expanded && rendered.length > previewLines) {
 			box.addChild(new Spacer(1));
-			box.addChild(new Text(theme.fg("muted", "expand for full diff"), 0, 0));
+			box.addChild(new Text(theme.fg("muted", "..."), 0, 0));
 		}
 	}
 
