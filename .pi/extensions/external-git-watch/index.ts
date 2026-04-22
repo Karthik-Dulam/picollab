@@ -123,35 +123,6 @@ function changeSignature(details: ExternalChangeMessageDetails): string {
 		.digest("hex");
 }
 
-function messageText(detailsList: ExternalChangeMessageDetails[]): string {
-	const fileLines = uniqueSorted(detailsList.flatMap((details) => details.files)).map((file) => `- ${file}`);
-	const diffBlock = detailsList
-		.map((details) => details.diff)
-		.filter(Boolean)
-		.join("\n\n");
-	const truncated = detailsList.some((details) => details.truncated);
-	return [
-		"External git change detected outside pi.",
-		"Likely source: user, script, or another agent.",
-		"",
-		"Changed files:",
-		fileLines.length > 0 ? fileLines.join("\n") : "- (no tracked files detected)",
-		"",
-		"Unified diff:",
-		diffBlock || "(no diff text available)",
-		truncated ? "\nNote: diff was truncated to keep the context manageable." : "",
-	].join("\n");
-}
-
-function metaText(detailsList: ExternalChangeMessageDetails[]): string {
-	const files = uniqueSorted(detailsList.flatMap((details) => details.files));
-	const source = detailsList.length === 1 ? detailsList[0]!.source : "external";
-	return [
-		`External git change detected outside pi.`,
-		`Source: ${source}.`,
-		files.length > 0 ? `Files: ${files.join(", ")}` : "Files: (none)",
-	].join("\n");
-}
 
 export default function externalGitWatchExtension(pi: ExtensionAPI) {
 	let repo: RepoSnapshot | undefined;
@@ -248,22 +219,12 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 
 				pi.sendMessage(
 					{
-						customType: "external-git-change-meta",
-						content: metaText([details]),
-						display: false,
-						details,
-					},
-					{ deliverAs: "steer" },
-				);
-
-				pi.sendMessage(
-					{
 						customType: "external-git-change",
 						content: details.diff,
 						display: true,
 						details,
 					},
-					{ deliverAs: "steer" },
+					{ deliverAs: "nextTurn" },
 				);
 			} while (repo.queuedScan);
 		} finally {
@@ -271,9 +232,21 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 		}
 	};
 
-	pi.registerMessageRenderer("external-git-change", (message, _options, _theme) => {
+	pi.registerMessageRenderer("external-git-change", (message, { expanded }, theme) => {
 		const content = typeof message.content === "string" ? message.content : "";
-		return new Text(renderDiff(content), 0, 0);
+		const additions = (content.match(/^\+/gm) ?? []).length;
+		const removals = (content.match(/^-/gm) ?? []).length;
+		let text = theme.fg("toolTitle", theme.bold("external git change"));
+		text += theme.fg("dim", "  ");
+		text += theme.fg("success", `+${additions}`);
+		text += theme.fg("dim", " / ");
+		text += theme.fg("error", `-${removals}`);
+
+		if (expanded) {
+			text += `\n\n${renderDiff(content)}`;
+		}
+
+		return new Text(text, 0, 0);
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
