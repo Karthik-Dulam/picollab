@@ -266,9 +266,9 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 				};
 
 				queueChange(details);
-				const signature = changeSignature(details);
-				repo.delivered.add(signature);
-				repo.pending = repo.pending.filter((item) => changeSignature(item) !== signature);
+				const detailSignature = changeSignature(details);
+				repo.delivered.add(detailSignature);
+				repo.pending = repo.pending.filter((item) => changeSignature(item) !== detailSignature);
 
 				pi.sendMessage(
 					{
