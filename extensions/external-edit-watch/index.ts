@@ -68,10 +68,14 @@ async function readSnapshot(root: string, files: string[]): Promise<Snapshot> {
 	return new Map(entries);
 }
 
-function statusText(repo: RepoSnapshot | undefined): string {
-	if (!repo) return "external-watch: inactive";
-	if (!repo.enabled) return `external-watch: disabled (${repo.root})`;
-	return `external-watch: watching ${repo.root}`;
+function statusText(repo: RepoSnapshot | undefined, theme?: any): string | undefined {
+	if (!repo) return undefined;
+	if (!theme) {
+		if (!repo.enabled) return "◌ ext";
+		return "● ext";
+	}
+	if (!repo.enabled) return theme.fg("dim", "◌ ext");
+	return theme.fg("accent", "●") + theme.fg("dim", " ext");
 }
 
 type DiffPart = {
@@ -320,7 +324,7 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 
 	const updateStatus = (ctx?: any) => {
 		if (!ctx?.ui) return;
-		ctx.ui.setStatus("external-watch", statusText(repo));
+		ctx.ui.setStatus("external-watch", statusText(repo, ctx.ui.theme));
 	};
 
 	const setEnabled = async (enabled: boolean, ctx?: any) => {
@@ -401,7 +405,7 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 		const root = await findRepoRoot(pi, ctx.cwd);
 		if (!root) {
 			ctx.ui.notify("external-watch disabled: current directory is not a git repo", "warning");
-			ctx.ui.setStatus("external-watch", "external-watch: inactive");
+			ctx.ui.setStatus("external-watch", undefined);
 			return;
 		}
 
@@ -439,12 +443,12 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 			// Ignore poller setup failures.
 		}
 
-		ctx.ui.setStatus("external-watch", statusText(repo));
+		updateStatus(ctx);
 		ctx.ui.notify(`external-watch active in ${root}`, "info");
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		ctx.ui.setStatus("external-watch", "external-watch: inactive");
+		ctx.ui.setStatus("external-watch", undefined);
 		cleanup();
 	});
 
@@ -476,7 +480,7 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const action = args.trim().toLowerCase() || "status";
 			if (action === "status") {
-				ctx.ui.notify(statusText(repo), "info");
+				ctx.ui.notify(statusText(repo) ?? "external-watch inactive", "info");
 				return;
 			}
 			if (!repo) {
