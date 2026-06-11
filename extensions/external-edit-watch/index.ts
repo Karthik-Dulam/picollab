@@ -360,26 +360,28 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 	};
 
 	const scan = async (_reason: string) => {
-		if (!repo || !repo.ready || !repo.enabled || repo.scanning) {
-			if (repo) repo.queuedScan = true;
+		const activeRepo = repo;
+		if (!activeRepo || !activeRepo.ready || !activeRepo.enabled || activeRepo.scanning) {
+			if (activeRepo) activeRepo.queuedScan = true;
 			return;
 		}
 
-		repo.scanning = true;
+		activeRepo.scanning = true;
 		try {
 			do {
-				repo.queuedScan = false;
+				activeRepo.queuedScan = false;
 
-				if (repo.mutationDepth > 0) {
-					await refreshBaseline();
+				if (activeRepo.mutationDepth > 0) {
+					await refreshTrackedFiles(pi, activeRepo);
+					activeRepo.baseline = await readSnapshot(activeRepo.root, activeRepo.trackedFiles);
 					continue;
 				}
 
-				await refreshTrackedFiles(pi, repo);
-				const current = await readSnapshot(repo.root, repo.trackedFiles);
+				await refreshTrackedFiles(pi, activeRepo);
+				const current = await readSnapshot(activeRepo.root, activeRepo.trackedFiles);
 
-				for (const filePath of repo.trackedFiles) {
-					const oldText = repo.baseline.get(filePath) ?? "";
+				for (const filePath of activeRepo.trackedFiles) {
+					const oldText = activeRepo.baseline.get(filePath) ?? "";
 					const newText = current.get(filePath) ?? "";
 					if (oldText === newText) continue;
 
@@ -387,13 +389,14 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 					if (!generated.diff) continue;
 
 					const details: ExternalEditMessageDetails = {
-						repoRoot: repo.root,
+						repoRoot: activeRepo.root,
 						filePath,
 						diff: generated.diff,
 						source: "external",
 						detectedAt: Date.now(),
 					};
 
+					if (repo !== activeRepo) continue;
 					pi.sendMessage(
 						{
 							customType: "external-edit",
@@ -405,10 +408,10 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 					);
 				}
 
-				repo.baseline = current;
-			} while (repo.queuedScan);
+				activeRepo.baseline = current;
+			} while (repo === activeRepo && activeRepo.queuedScan);
 		} finally {
-			repo.scanning = false;
+			activeRepo.scanning = false;
 		}
 	};
 
