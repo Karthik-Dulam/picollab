@@ -445,7 +445,7 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 			mutationDepth: 0,
 			mutationCallIds: new Set<string>(),
 			ready: false,
-			enabled: true,
+			enabled: false,
 		};
 
 		repo.ready = true;
@@ -467,7 +467,6 @@ export default function externalGitWatchExtension(pi: ExtensionAPI) {
 		}
 
 		updateStatus(ctx);
-		ctx.ui.notify(`external-watch active in ${root}`, "info");
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
